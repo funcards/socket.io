@@ -1,6 +1,7 @@
 package sio
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"github.com/funcards/engine.io"
@@ -17,13 +18,13 @@ var ErrEmptyEvent = errors.New("event cannot be empty")
 
 type (
 	// AllEventListener callback for all user events received on socket
-	AllEventListener func(event string, args ...any) error
+	AllEventListener func(ctx context.Context, event string, args ...any)
 
 	// ReceivedByRemoteAcknowledgement callback for remote received acknowledgement. Called when remote client calls ack callback.
-	ReceivedByRemoteAcknowledgement func(args ...any) error
+	ReceivedByRemoteAcknowledgement func(ctx context.Context, args ...any)
 
 	// ReceivedByLocalAcknowledgement callback for local received acknowledgement. Call this method to send ack to remote client.
-	ReceivedByLocalAcknowledgement func(args ...any) error
+	ReceivedByLocalAcknowledgement func(ctx context.Context, args ...any)
 
 	Socket interface {
 		eio.Emitter
@@ -33,22 +34,22 @@ type (
 		GetConnectData() any
 		GetInitialQuery() url.Values
 		GetInitialHeaders() map[string]string
-		Disconnect(close bool) error
-		Broadcast(rooms []string, event string, args ...any) error
-		Send(acknowledgement ReceivedByRemoteAcknowledgement, event string, args ...any) error
-		JoinRooms(rooms ...string) error
-		LeaveRooms(rooms ...string) error
-		LeaveAllRooms() error
+		Disconnect(ctx context.Context, close bool)
+		Broadcast(ctx context.Context, rooms []string, event string, args ...any)
+		Send(ctx context.Context, acknowledgement ReceivedByRemoteAcknowledgement, event string, args ...any)
+		JoinRooms(ctx context.Context, rooms ...string)
+		LeaveRooms(ctx context.Context, rooms ...string)
+		LeaveAllRooms(ctx context.Context)
 		RegisterAllEventListener(listener AllEventListener)
 		UnregisterAllEventListener(listener AllEventListener)
-		OnEvent(packet siop.Packet) error
-		OnAck(packet siop.Packet) error
-		OnPacket(packet siop.Packet) error
-		OnConnect() error
-		OnDisconnect() error
-		OnClose(reason string) error
-		OnError(msg string) error
-		SendPacket(packet siop.Packet) error
+		OnEvent(ctx context.Context, packet siop.Packet)
+		OnAck(ctx context.Context, packet siop.Packet)
+		OnPacket(ctx context.Context, packet siop.Packet)
+		OnConnect(ctx context.Context)
+		OnDisconnect(ctx context.Context)
+		OnClose(ctx context.Context, reason string)
+		OnError(ctx context.Context, msg string)
+		SendPacket(ctx context.Context, packet siop.Packet)
 	}
 
 	socket struct {
@@ -109,32 +110,31 @@ func (s *socket) GetInitialHeaders() map[string]string {
 	return s.client.GetInitialHeaders()
 }
 
-func (s *socket) Disconnect(close bool) error {
+func (s *socket) Disconnect(ctx context.Context, close bool) {
 	if s.connected {
 		if close {
-			return s.client.Disconnect()
+			s.client.Disconnect(ctx)
+			return
 		}
 
-		if err := s.SendPacket(siop.Packet{Type: siop.Disconnect}); err != nil {
-			s.log.Warn("socket send packet", zap.Error(err))
-		}
-
-		return s.OnClose("server namespace disconnect")
+		s.SendPacket(ctx, siop.Packet{Type: siop.Disconnect})
+		s.OnClose(ctx, "server namespace disconnect")
 	}
-	return nil
 }
 
-func (s *socket) Broadcast(rooms []string, event string, args ...any) error {
+func (s *socket) Broadcast(ctx context.Context, rooms []string, event string, args ...any) {
 	if len(event) == 0 {
-		return ErrEmptyEvent
+		eio.TryCancel(ctx, ErrEmptyEvent)
+		return
 	}
 
-	return s.adapter.Broadcast(CreateDataPacket(siop.Event, event, args...), rooms, s.GetSID())
+	s.adapter.Broadcast(ctx, CreateDataPacket(siop.Event, event, args...), rooms, s.GetSID())
 }
 
-func (s *socket) Send(acknowledgement ReceivedByRemoteAcknowledgement, event string, args ...any) error {
+func (s *socket) Send(ctx context.Context, acknowledgement ReceivedByRemoteAcknowledgement, event string, args ...any) {
 	if len(event) == 0 {
-		return ErrEmptyEvent
+		eio.TryCancel(ctx, ErrEmptyEvent)
+		return
 	}
 
 	packet := CreateDataPacket(siop.Event, event, args...)
@@ -148,52 +148,42 @@ func (s *socket) Send(acknowledgement ReceivedByRemoteAcknowledgement, event str
 		s.amu.Unlock()
 	}
 
-	return s.SendPacket(packet)
+	s.SendPacket(ctx, packet)
 }
 
-func (s *socket) JoinRooms(rooms ...string) error {
+func (s *socket) JoinRooms(ctx context.Context, rooms ...string) {
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
 
 	for _, room := range rooms {
 		if _, ok := s.rooms[room]; !ok {
-			if err := s.adapter.Add(room, s); err != nil {
-				return err
-			}
+			s.adapter.Add(ctx, room, s)
 			s.rooms[room] = true
 		}
 	}
-	return nil
 }
 
-func (s *socket) LeaveRooms(rooms ...string) error {
+func (s *socket) LeaveRooms(ctx context.Context, rooms ...string) {
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
 
 	for _, room := range rooms {
 		if _, ok := s.rooms[room]; ok {
-			if err := s.adapter.Remove(room, s); err != nil {
-				return err
-			}
+			s.adapter.Remove(ctx, room, s)
 			delete(s.rooms, room)
 		}
 	}
-	return nil
 }
 
-func (s *socket) LeaveAllRooms() error {
+func (s *socket) LeaveAllRooms(ctx context.Context) {
 	s.rmu.Lock()
 	defer s.rmu.Unlock()
 
 	for room, _ := range s.rooms {
-		if err := s.adapter.Remove(room, s); err != nil {
-			return err
-		}
+		s.adapter.Remove(ctx, room, s)
 	}
 
 	s.rooms = make(map[string]bool)
-
-	return nil
 }
 
 func (s *socket) RegisterAllEventListener(listener AllEventListener) {
@@ -217,16 +207,16 @@ func (s *socket) UnregisterAllEventListener(listener AllEventListener) {
 	s.allEventListeners = newListeners
 }
 
-func (s *socket) OnEvent(packet siop.Packet) error {
+func (s *socket) OnEvent(ctx context.Context, packet siop.Packet) {
 	args := s.unpackData(packet.Data)
 
 	if packet.ID != nil {
 		emitArgs := make([]any, len(args)+1)
 		copy(emitArgs, args)
-		emitArgs[len(args)] = ReceivedByLocalAcknowledgement(func(args1 ...any) error {
+		emitArgs[len(args)] = ReceivedByLocalAcknowledgement(func(ctx context.Context, args1 ...any) {
 			ack := CreateDataPacket(siop.Ack, "", args1...)
 			ack.ID = packet.ID
-			return s.SendPacket(ack)
+			s.SendPacket(ctx, ack)
 		})
 		args = emitArgs
 	}
@@ -235,22 +225,17 @@ func (s *socket) OnEvent(packet siop.Packet) error {
 	eventArgs := make([]any, len(args)-1)
 	copy(eventArgs, args[1:])
 
-	if err := s.Emit(event, eventArgs...); err != nil {
-		return err
-	}
+	s.Emit(ctx, event, eventArgs...)
 
 	s.emu.Lock()
 	defer s.emu.Unlock()
 
 	for _, listener := range s.allEventListeners {
-		if err := listener(event, eventArgs...); err != nil {
-			return err
-		}
+		listener(ctx, event, eventArgs...)
 	}
-	return nil
 }
 
-func (s *socket) OnAck(packet siop.Packet) error {
+func (s *socket) OnAck(ctx context.Context, packet siop.Packet) {
 	s.amu.RLock()
 	ack, ok := s.acknowledgements[*packet.ID]
 	s.amu.RUnlock()
@@ -260,35 +245,29 @@ func (s *socket) OnAck(packet siop.Packet) error {
 		delete(s.acknowledgements, *packet.ID)
 		s.amu.Unlock()
 
-		return ack(s.unpackData(packet.Data)...)
+		ack(ctx, s.unpackData(packet.Data)...)
 	}
-	return nil
 }
 
-func (s *socket) OnPacket(packet siop.Packet) error {
+func (s *socket) OnPacket(ctx context.Context, packet siop.Packet) {
 	switch packet.Type {
 	case siop.Event, siop.BinaryEvent:
-		return s.OnEvent(packet)
+		s.OnEvent(ctx, packet)
 	case siop.Ack, siop.BinaryAck:
-		return s.OnAck(packet)
+		s.OnAck(ctx, packet)
 	case siop.Disconnect:
-		return s.OnDisconnect()
+		s.OnDisconnect(ctx)
 	case siop.ConnectError:
-		return s.OnError(packet.Data.(string))
+		s.OnError(ctx, packet.Data.(string))
 	}
-	return nil
 }
 
-func (s *socket) OnConnect() error {
+func (s *socket) OnConnect(ctx context.Context) {
 	s.log.Debug("sio.Socket new connection", zap.String("sid", s.GetSID()), zap.Any("connect_data", s.connectData))
 
 	s.namespace.AddConnected(s)
-
-	if err := s.JoinRooms(s.GetSID()); err != nil {
-		return err
-	}
-
-	return s.SendPacket(siop.Packet{
+	s.JoinRooms(ctx, s.GetSID())
+	s.SendPacket(ctx, siop.Packet{
 		Type: siop.Connect,
 		Data: map[string]string{
 			"sid": s.GetSID(),
@@ -296,38 +275,33 @@ func (s *socket) OnConnect() error {
 	})
 }
 
-func (s *socket) OnDisconnect() error {
-	return s.OnClose("client namespace disconnect")
+func (s *socket) OnDisconnect(ctx context.Context) {
+	s.OnClose(ctx, "client namespace disconnect")
 }
 
-func (s *socket) OnClose(reason string) error {
+func (s *socket) OnClose(ctx context.Context, reason string) {
 	if !s.connected {
-		return nil
+		return
 	}
 
-	if err := s.Emit(eio.TopicDisconnecting, reason); err != nil {
-		s.log.Warn("socket emit on close", zap.Error(err))
-	}
+	s.Emit(ctx, eio.TopicDisconnecting, reason)
 
-	if err := s.LeaveAllRooms(); err != nil {
-		s.log.Warn("socket leave rooms", zap.Error(err))
-	}
-
+	s.LeaveAllRooms(ctx)
 	s.namespace.Remove(s)
 	s.client.Remove(s)
 	s.connected = false
 	s.namespace.RemoveConnected(s)
 
-	return s.Emit(eio.TopicDisconnect, reason)
+	s.Emit(ctx, eio.TopicDisconnect, reason)
 }
 
-func (s *socket) OnError(msg string) error {
-	return s.Emit(eio.TopicError, msg)
+func (s *socket) OnError(ctx context.Context, msg string) {
+	s.Emit(ctx, eio.TopicError, msg)
 }
 
-func (s *socket) SendPacket(packet siop.Packet) error {
+func (s *socket) SendPacket(ctx context.Context, packet siop.Packet) {
 	packet.Nsp = s.namespace.GetName()
-	return s.client.SendPacket(packet)
+	s.client.SendPacket(ctx, packet)
 }
 
 func (s *socket) unpackData(data any) (newData []any) {

@@ -1,6 +1,7 @@
 package sio
 
 import (
+	"context"
 	"github.com/funcards/engine.io"
 	"github.com/funcards/engine.io-parser/v4"
 	"github.com/funcards/socket.io-parser/v5"
@@ -18,10 +19,10 @@ type (
 		GetInitialQuery() url.Values
 		GetInitialHeaders() map[string]string
 		GetConnection() eio.Socket
-		SendPacket(packet siop.Packet) error
+		SendPacket(ctx context.Context, packet siop.Packet)
 		Remove(sck Socket)
-		Connect(nsp string, data any) error
-		Disconnect() error
+		Connect(ctx context.Context, nsp string, data any)
+		Disconnect(ctx context.Context)
 	}
 
 	client struct {
@@ -39,7 +40,7 @@ type (
 	}
 )
 
-func NewClient(server Server, connection eio.Socket, logger *zap.Logger) *client {
+func NewClient(ctx context.Context, server Server, connection eio.Socket, logger *zap.Logger) *client {
 	c := &client{
 		server:           server,
 		connection:       connection,
@@ -48,7 +49,7 @@ func NewClient(server Server, connection eio.Socket, logger *zap.Logger) *client
 		sockets:          make(map[string]Socket),
 		namespaceSockets: make(map[string]Socket),
 	}
-	c.setup()
+	c.setup(ctx)
 
 	return c
 }
@@ -69,16 +70,13 @@ func (c *client) GetConnection() eio.Socket {
 	return c.connection
 }
 
-func (c *client) SendPacket(packet siop.Packet) error {
+func (c *client) SendPacket(ctx context.Context, packet siop.Packet) {
 	if c.connection.GetState() == eio.Open {
 		for _, encoded := range packet.Encode() {
 			ePck := eiop.MessagePacket(encoded)
-			if err := c.connection.Send(ePck); err != nil {
-				return err
-			}
+			c.connection.Send(ctx, ePck)
 		}
 	}
-	return nil
 }
 
 func (c *client) Remove(sck Socket) {
@@ -97,12 +95,13 @@ func (c *client) Remove(sck Socket) {
 	}
 }
 
-func (c *client) Connect(nsp string, data any) error {
+func (c *client) Connect(ctx context.Context, nsp string, data any) {
 	if c.server.HasNamespace(nsp) || c.server.CheckNamespace(nsp) {
-		return c.doConnect(nsp, data)
+		c.doConnect(ctx, nsp, data)
+		return
 	}
 
-	return c.SendPacket(siop.Packet{
+	c.SendPacket(ctx, siop.Packet{
 		Type: siop.ConnectError,
 		Nsp:  nsp,
 		Data: map[string]string{
@@ -111,55 +110,50 @@ func (c *client) Connect(nsp string, data any) error {
 	})
 }
 
-func (c *client) Disconnect() error {
+func (c *client) Disconnect(ctx context.Context) {
 	c.smu.Lock()
 	for sid, sck := range c.sockets {
-		if err := sck.Disconnect(false); err != nil {
-			c.log.Warn("socket client disconnect", zap.Error(err))
-		}
+		sck.Disconnect(ctx, false)
 		delete(c.sockets, sid)
 	}
 	c.smu.Unlock()
 
-	return c.close()
+	c.close(ctx)
 }
 
-func (c *client) close() error {
+func (c *client) close(ctx context.Context) {
 	if c.connection.GetState() == eio.Open {
-		if err := c.connection.Close(); err != nil {
-			c.log.Warn("socket client close", zap.Error(err))
-		}
-		return c.onClose("forced server close")
+		c.connection.Close(ctx)
+		c.onClose(ctx, "forced server close")
 	}
-	return nil
 }
 
-func (c *client) setup() {
+func (c *client) setup(ctx context.Context) {
 	c.decoder.OnDecoded(func(pkt siop.Packet) error {
 		if pkt.Type == siop.Connect {
-			return c.Connect(pkt.Nsp, pkt.Data)
+			c.Connect(ctx, pkt.Nsp, pkt.Data)
+			return nil
 		}
 
 		c.nmu.RLock()
 		defer c.nmu.RUnlock()
 
 		if sck, ok := c.namespaceSockets[pkt.Nsp]; ok {
-			return sck.OnPacket(pkt)
+			sck.OnPacket(ctx, pkt)
 		}
 
 		return nil
 	})
-	c.connection.On(eio.TopicData, func(event *eio.Event) error {
+	c.connection.On(eio.TopicData, func(ctx context.Context, event *eio.Event) {
 		if err := c.decoder.Add(event.Get(1)); err != nil {
-			return c.onError(err.Error())
+			c.onError(ctx, err.Error())
 		}
-		return nil
 	})
-	c.connection.On(eio.TopicError, func(event *eio.Event) error {
-		return c.onError(event.String(1))
+	c.connection.On(eio.TopicError, func(ctx context.Context, event *eio.Event) {
+		c.onError(ctx, event.String(1))
 	})
-	c.connection.On(eio.TopicClose, func(event *eio.Event) error {
-		return c.onClose(event.String(1))
+	c.connection.On(eio.TopicClose, func(ctx context.Context, event *eio.Event) {
+		c.onClose(ctx, event.String(1))
 	})
 
 	c.timeoutFuture = time.AfterFunc(c.server.GetConfig().ConnectionTimeout, c.connectionTimeout)
@@ -169,12 +163,9 @@ func (c *client) destroy() {
 	c.connection.Off(eio.TopicData, eio.TopicError, eio.TopicClose)
 }
 
-func (c *client) doConnect(nsp string, data any) error {
+func (c *client) doConnect(ctx context.Context, nsp string, data any) {
 	nspImpl := c.server.Namespace(nsp).(*NamespaceImpl)
-	sck, err := nspImpl.Add(c, data)
-	if err != nil {
-		return err
-	}
+	sck := nspImpl.Add(ctx, c, data)
 
 	c.smu.Lock()
 	c.sockets[sck.GetSID()] = sck
@@ -183,39 +174,30 @@ func (c *client) doConnect(nsp string, data any) error {
 	c.nmu.Lock()
 	c.namespaceSockets[nsp] = sck
 	c.nmu.Unlock()
-
-	return nil
 }
 
-func (c *client) onClose(reason string) error {
+func (c *client) onClose(ctx context.Context, reason string) {
 	c.stopTimers()
 	c.destroy()
 
 	c.smu.Lock()
-	for sid, sck := range c.sockets {
-		if err := sck.OnClose(reason); err != nil {
-			c.log.Warn("socket client onCLose", zap.Error(err))
-			delete(c.sockets, sid)
-		}
+	for _, sck := range c.sockets {
+		sck.OnClose(ctx, reason)
 	}
 	c.smu.Unlock()
 
 	c.decoder.Destroy()
-
-	return nil
 }
 
-func (c *client) onError(msg string) error {
+func (c *client) onError(ctx context.Context, msg string) {
 	c.smu.RLock()
 	defer c.smu.RUnlock()
 
 	for _, sck := range c.sockets {
-		if err := sck.OnError(msg); err != nil {
-			c.log.Warn("socket client onError", zap.Error(err))
-		}
+		sck.OnError(ctx, msg)
 	}
 
-	return c.connection.Close()
+	c.connection.Close(ctx)
 }
 
 func (c *client) connectionTimeout() {
@@ -223,9 +205,7 @@ func (c *client) connectionTimeout() {
 	defer c.nmu.RUnlock()
 
 	if len(c.namespaceSockets) == 0 {
-		if err := c.close(); err != nil {
-			c.log.Warn("socket connection timeout", zap.Error(err))
-		}
+		c.close(context.Background())
 	}
 }
 

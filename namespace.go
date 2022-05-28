@@ -1,6 +1,7 @@
 package sio
 
 import (
+	"context"
 	"github.com/funcards/engine.io"
 	"github.com/funcards/socket.io-parser/v5"
 	"go.uber.org/zap"
@@ -22,7 +23,7 @@ type (
 		GetServer() Server
 		GetAdapter() Adapter
 		GetConnectedSockets() map[string]Socket
-		Broadcast(rooms []string, event string, args ...any) error
+		Broadcast(ctx context.Context, rooms []string, event string, args ...any)
 	}
 
 	BaseNamespace struct {
@@ -84,7 +85,7 @@ func (n *NamespaceImpl) NextID() uint64 {
 	return atomic.LoadUint64(&(n.ackID))
 }
 
-func (n *NamespaceImpl) Add(client Client, data any) (Socket, error) {
+func (n *NamespaceImpl) Add(ctx context.Context, client Client, data any) Socket {
 	n.log.Debug("namespace new connection", zap.String("name", n.GetName()), zap.Any("connect_data", data))
 
 	sck := NewSocket(n, client, data, n.log)
@@ -94,19 +95,12 @@ func (n *NamespaceImpl) Add(client Client, data any) (Socket, error) {
 		n.sockets[sck.GetSID()] = sck
 		n.smu.Unlock()
 
-		if err := sck.OnConnect(); err != nil {
-			return nil, err
-		}
-
-		if err := n.Emit(eio.TopicConnect, sck); err != nil {
-			return nil, err
-		}
-		if err := n.Emit(eio.TopicConnection, sck); err != nil {
-			return nil, err
-		}
+		sck.OnConnect(ctx)
+		n.Emit(ctx, eio.TopicConnect, sck)
+		n.Emit(ctx, eio.TopicConnection, sck)
 	}
 
-	return sck, nil
+	return sck
 }
 
 func (n *NamespaceImpl) Remove(sck Socket) {
@@ -141,12 +135,12 @@ func (n *NamespaceImpl) GetConnectedSockets() map[string]Socket {
 	return data
 }
 
-func (n *NamespaceImpl) Broadcast(rooms []string, event string, args ...any) error {
+func (n *NamespaceImpl) Broadcast(ctx context.Context, rooms []string, event string, args ...any) {
 	if len(event) == 0 {
-		return ErrEmptyEvent
+		eio.TryCancel(ctx, ErrEmptyEvent)
+		return
 	}
 
 	packet := CreateDataPacket(siop.Event, event, args...)
-
-	return n.adapter.Broadcast(packet, rooms)
+	n.adapter.Broadcast(ctx, packet, rooms)
 }

@@ -1,6 +1,7 @@
 package sio
 
 import (
+	"context"
 	"github.com/funcards/engine.io"
 	"github.com/funcards/socket.io-parser/v5"
 	"go.uber.org/zap"
@@ -15,9 +16,9 @@ type (
 	Adapter interface {
 		eio.Emitter
 
-		Broadcast(packet siop.Packet, rooms []string, socketsExcluded ...string) error
-		Add(room string, sck Socket) error
-		Remove(room string, sck Socket) error
+		Broadcast(ctx context.Context, packet siop.Packet, rooms []string, socketsExcluded ...string)
+		Add(ctx context.Context, room string, sck Socket)
+		Remove(ctx context.Context, room string, sck Socket)
 		ListClients(room string) []Socket
 		ListClientRooms(sck Socket) []string
 	}
@@ -45,7 +46,7 @@ func NewMemoryAdapter(namespace Namespace, logger *zap.Logger) *memoryAdapter {
 	}
 }
 
-func (a *memoryAdapter) Broadcast(packet siop.Packet, rooms []string, socketsExcluded ...string) error {
+func (a *memoryAdapter) Broadcast(ctx context.Context, packet siop.Packet, rooms []string, socketsExcluded ...string) {
 	excluded := make(map[string]bool, len(socketsExcluded))
 	for _, s := range socketsExcluded {
 		excluded[s] = true
@@ -63,9 +64,7 @@ func (a *memoryAdapter) Broadcast(packet siop.Packet, rooms []string, socketsExc
 			}
 
 			if s, ok := connectedSockets[sid]; ok {
-				if err := s.SendPacket(packet); err != nil {
-					a.log.Warn("adapter broadcast send packet", zap.Error(err))
-				}
+				s.SendPacket(ctx, packet)
 			}
 		}
 	} else {
@@ -85,19 +84,15 @@ func (a *memoryAdapter) Broadcast(packet siop.Packet, rooms []string, socketsExc
 					}
 					if _, ok1 := connectedSockets[s.GetSID()]; ok1 {
 						sentSocketIds[s.GetSID()] = true
-						if err := s.SendPacket(packet); err != nil {
-							a.log.Warn("adapter broadcast send packet", zap.Error(err))
-						}
+						s.SendPacket(ctx, packet)
 					}
 				}
 			}
 		}
 	}
-
-	return nil
 }
 
-func (a *memoryAdapter) Add(room string, sck Socket) error {
+func (a *memoryAdapter) Add(_ context.Context, room string, sck Socket) {
 	a.rmu.RLock()
 	sockets, sok := a.roomSockets[room]
 	a.rmu.RUnlock()
@@ -143,11 +138,9 @@ func (a *memoryAdapter) Add(room string, sck Socket) error {
 		a.socketRooms[sck.GetSID()] = []string{room}
 		a.smu.Unlock()
 	}
-
-	return nil
 }
 
-func (a *memoryAdapter) Remove(room string, sck Socket) error {
+func (a *memoryAdapter) Remove(_ context.Context, room string, sck Socket) {
 	a.rmu.RLock()
 	sockets, sok := a.roomSockets[room]
 	a.rmu.RUnlock()
@@ -187,8 +180,6 @@ func (a *memoryAdapter) Remove(room string, sck Socket) error {
 		}
 		a.smu.Unlock()
 	}
-
-	return nil
 }
 
 func (a *memoryAdapter) ListClients(room string) []Socket {

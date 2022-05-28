@@ -1,6 +1,7 @@
 package sio
 
 import (
+	"context"
 	"github.com/funcards/engine.io"
 	"go.uber.org/zap"
 	"sync"
@@ -47,10 +48,9 @@ func NewServer(eServer eio.Server, adapterFactory AdapterFactory, cfg Config, lo
 
 	_ = s.Namespace("/")
 
-	eServer.On(eio.TopicConnection, func(event *eio.Event) error {
+	eServer.On(eio.TopicConnection, func(ctx context.Context, event *eio.Event) {
 		sck := event.Get(0).(eio.Socket)
-		NewClient(s, sck, logger)
-		return nil
+		NewClient(ctx, s, sck, logger)
 	})
 
 	return s
