@@ -1,146 +1,112 @@
 package sio
 
 import (
-	"context"
 	"github.com/funcards/engine.io"
 	"github.com/funcards/socket.io-parser/v5"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"sync"
-	"sync/atomic"
 )
 
-var _ Namespace = (*NamespaceImpl)(nil)
+var _ Namespace = (*namespace)(nil)
 
-type (
-	NamespaceProvider interface {
-		CheckNamespace(nsp string) bool
-	}
+type Namespace interface {
+	eio.Emitter
 
-	Namespace interface {
-		eio.Emitter
-
-		GetName() string
-		GetServer() Server
-		GetAdapter() Adapter
-		GetConnectedSockets() map[string]Socket
-		Broadcast(ctx context.Context, rooms []string, event string, args ...any)
-	}
-
-	BaseNamespace struct {
-		eio.Emitter
-
-		name    string
-		server  Server
-		adapter Adapter
-		log     *zap.Logger
-	}
-
-	NamespaceImpl struct {
-		*BaseNamespace
-
-		ackID uint64
-
-		smu     sync.RWMutex
-		sockets map[string]Socket
-
-		cmu              sync.RWMutex
-		connectedSockets map[string]Socket
-	}
-)
-
-func NewBaseNamespace(name string, server Server, logger *zap.Logger) *BaseNamespace {
-	return &BaseNamespace{
-		Emitter: eio.NewEmitter(logger),
-		name:    name,
-		server:  server,
-		log:     logger,
-	}
+	NextAckID() uint64
+	Name() string
+	Server() Server
+	Adapter() Adapter
+	Add(client Client, data any) Socket
+	Remove(sck Socket)
+	AddConnected(sck Socket)
+	RemoveConnected(sck Socket)
+	ConnectedSockets() map[string]Socket
+	Broadcast(rooms []string, event string, args ...any)
 }
 
-func (n *BaseNamespace) GetName() string {
-	return n.name
+type namespace struct {
+	eio.Emitter
+
+	ackID       *atomic.Uint64
+	name        string
+	srv         Server
+	adapter     Adapter
+	log         *zap.Logger
+	sockets     *sync.Map
+	connSockets *sync.Map
 }
 
-func (n *BaseNamespace) GetServer() Server {
-	return n.server
-}
-
-func (n *BaseNamespace) GetAdapter() Adapter {
-	return n.adapter
-}
-
-func NewNamespaceImpl(name string, server Server, logger *zap.Logger) *NamespaceImpl {
-	n := &NamespaceImpl{
-		BaseNamespace:    NewBaseNamespace(name, server, logger),
-		ackID:            0,
-		sockets:          make(map[string]Socket),
-		connectedSockets: make(map[string]Socket),
+func NewNamespace(name string, srv Server, logger *zap.Logger) *namespace {
+	n := &namespace{
+		Emitter:     eio.NewEmitter(),
+		ackID:       atomic.NewUint64(0),
+		name:        name,
+		srv:         srv,
+		log:         logger,
+		sockets:     new(sync.Map),
+		connSockets: new(sync.Map),
 	}
-	n.adapter = server.GetAdapterFactory()(n)
+	n.adapter = srv.AdapterFactory()(n)
 	return n
 }
 
-func (n *NamespaceImpl) NextID() uint64 {
-	atomic.AddUint64(&(n.ackID), 1)
-	return atomic.LoadUint64(&(n.ackID))
+func (n *namespace) NextAckID() uint64 {
+	return n.ackID.Inc()
 }
 
-func (n *NamespaceImpl) Add(ctx context.Context, client Client, data any) Socket {
-	n.log.Debug("namespace new connection", zap.String("name", n.GetName()), zap.Any("connect_data", data))
+func (n *namespace) Name() string {
+	return n.name
+}
 
+func (n *namespace) Server() Server {
+	return n.srv
+}
+
+func (n *namespace) Adapter() Adapter {
+	return n.adapter
+}
+
+func (n *namespace) Add(client Client, data any) Socket {
 	sck := NewSocket(n, client, data, n.log)
 
-	if client.GetConnection().GetState() == eio.Open {
-		n.smu.Lock()
-		n.sockets[sck.GetSID()] = sck
-		n.smu.Unlock()
-
-		sck.OnConnect(ctx)
-		n.Emit(ctx, eio.TopicConnect, sck)
-		n.Emit(ctx, eio.TopicConnection, sck)
+	if client.Conn().State() == eio.Open {
+		n.log.Debug("namespace: add new connection", zap.String("nsp", n.Name()), zap.Any("data", data))
+		n.sockets.Store(sck.SID(), sck)
+		sck.OnConnect()
+		n.Fire(eio.TopicConnection, sck)
 	}
 
 	return sck
 }
 
-func (n *NamespaceImpl) Remove(sck Socket) {
-	n.smu.Lock()
-	defer n.smu.Unlock()
-
-	delete(n.sockets, sck.GetSID())
+func (n *namespace) Remove(sck Socket) {
+	n.sockets.Delete(sck.SID())
 }
 
-func (n *NamespaceImpl) AddConnected(sck Socket) {
-	n.cmu.Lock()
-	defer n.cmu.Unlock()
-
-	n.connectedSockets[sck.GetSID()] = sck
+func (n *namespace) AddConnected(sck Socket) {
+	n.connSockets.Store(sck.SID(), sck)
 }
 
-func (n *NamespaceImpl) RemoveConnected(sck Socket) {
-	n.cmu.Lock()
-	defer n.cmu.Unlock()
-
-	delete(n.connectedSockets, sck.GetSID())
+func (n *namespace) RemoveConnected(sck Socket) {
+	n.connSockets.Delete(sck.SID())
 }
 
-func (n *NamespaceImpl) GetConnectedSockets() map[string]Socket {
-	n.cmu.RLock()
-	defer n.cmu.RUnlock()
-
-	data := make(map[string]Socket)
-	for sid, sck := range n.connectedSockets {
-		data[sid] = sck
-	}
+func (n *namespace) ConnectedSockets() map[string]Socket {
+	data := map[string]Socket{}
+	n.connSockets.Range(func(key, value any) bool {
+		data[key.(string)] = value.(Socket)
+		return true
+	})
 	return data
 }
 
-func (n *NamespaceImpl) Broadcast(ctx context.Context, rooms []string, event string, args ...any) {
+func (n *namespace) Broadcast(rooms []string, event string, args ...any) {
 	if len(event) == 0 {
-		eio.TryCancel(ctx, ErrEmptyEvent)
+		n.log.Warn("namespace: broadcast event is empty")
 		return
 	}
 
 	packet := CreateDataPacket(siop.Event, event, args...)
-	n.adapter.Broadcast(ctx, packet, rooms)
+	n.adapter.Broadcast(packet, rooms)
 }

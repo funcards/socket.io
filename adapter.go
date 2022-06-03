@@ -1,209 +1,131 @@
 package sio
 
 import (
-	"context"
-	"github.com/funcards/engine.io"
 	"github.com/funcards/socket.io-parser/v5"
 	"go.uber.org/zap"
 	"sync"
 )
 
-var _ Adapter = (*memoryAdapter)(nil)
+var _ Adapter = (*adapter)(nil)
 
-type (
-	AdapterFactory func(namespace Namespace) Adapter
+type AdapterFactory func(nsp Namespace) Adapter
 
-	Adapter interface {
-		eio.Emitter
+type Adapter interface {
+	Broadcast(packet siop.Packet, rooms []string, excluded ...string)
+	Add(room string, sck Socket)
+	Remove(room string, sck Socket)
+	Clients(room string) []Socket
+	Rooms(client Socket) []string
+}
 
-		Broadcast(ctx context.Context, packet siop.Packet, rooms []string, socketsExcluded ...string)
-		Add(ctx context.Context, room string, sck Socket)
-		Remove(ctx context.Context, room string, sck Socket)
-		ListClients(room string) []Socket
-		ListClientRooms(sck Socket) []string
-	}
+type adapter struct {
+	nsp         Namespace
+	log         *zap.Logger
+	roomSockets *sync.Map //map[room][sid]Socket
+	socketRooms *sync.Map //map[sid][room]bool
+}
 
-	memoryAdapter struct {
-		eio.Emitter
-		namespace Namespace
-		log       *zap.Logger
-
-		roomSockets map[string][]Socket
-		rmu         sync.RWMutex
-
-		socketRooms map[string][]string
-		smu         sync.RWMutex
-	}
-)
-
-func NewMemoryAdapter(namespace Namespace, logger *zap.Logger) *memoryAdapter {
-	return &memoryAdapter{
-		Emitter:     eio.NewEmitter(logger),
-		namespace:   namespace,
+func NewAdapter(nsp Namespace, logger *zap.Logger) *adapter {
+	return &adapter{
+		nsp:         nsp,
 		log:         logger,
-		roomSockets: make(map[string][]Socket),
-		socketRooms: make(map[string][]string),
+		roomSockets: new(sync.Map),
+		socketRooms: new(sync.Map),
 	}
 }
 
-func (a *memoryAdapter) Broadcast(ctx context.Context, packet siop.Packet, rooms []string, socketsExcluded ...string) {
-	excluded := make(map[string]bool, len(socketsExcluded))
-	for _, s := range socketsExcluded {
-		excluded[s] = true
-	}
+func (a *adapter) Broadcast(packet siop.Packet, rooms []string, excluded ...string) {
+	a.log.Debug("adapter broadcast before send packet")
 
-	connectedSockets := a.namespace.GetConnectedSockets()
+	sidExcluded := make(map[string]bool, len(excluded))
+	for _, s := range excluded {
+		sidExcluded[s] = true
+	}
+	connected := a.nsp.ConnectedSockets()
 
 	if len(rooms) == 0 {
-		a.smu.RLock()
-		defer a.smu.RUnlock()
-
-		for sid, _ := range a.socketRooms {
-			if _, ok := excluded[sid]; ok {
-				continue
-			}
-
-			if s, ok := connectedSockets[sid]; ok {
-				s.SendPacket(ctx, packet)
-			}
-		}
-	} else {
-		sentSocketIds := make(map[string]bool)
-		for _, room := range rooms {
-			a.rmu.RLock()
-			sockets, ok := a.roomSockets[room]
-			a.rmu.RUnlock()
-
-			if ok {
-				for _, s := range sockets {
-					if _, ok1 := excluded[s.GetSID()]; ok1 {
-						continue
-					}
-					if _, ok1 := sentSocketIds[s.GetSID()]; ok1 {
-						continue
-					}
-					if _, ok1 := connectedSockets[s.GetSID()]; ok1 {
-						sentSocketIds[s.GetSID()] = true
-						s.SendPacket(ctx, packet)
-					}
+		a.socketRooms.Range(func(key, value any) bool {
+			if _, ok := sidExcluded[key.(string)]; !ok {
+				if s, ok1 := connected[key.(string)]; ok1 {
+					a.log.Debug("adapter broadcast sending packet...")
+					s.SendPacket(packet)
 				}
 			}
-		}
-	}
-}
-
-func (a *memoryAdapter) Add(_ context.Context, room string, sck Socket) {
-	a.rmu.RLock()
-	sockets, sok := a.roomSockets[room]
-	a.rmu.RUnlock()
-
-	if sok {
-		added := false
-		for _, s := range sockets {
-			if s.GetSID() == sck.GetSID() {
-				added = true
-				break
-			}
-		}
-		if !added {
-			a.rmu.Lock()
-			a.roomSockets[room] = append(a.roomSockets[room], sck)
-			a.rmu.Unlock()
-		}
+			return true
+		})
 	} else {
-		a.rmu.Lock()
-		a.roomSockets[room] = []Socket{sck}
-		a.rmu.Unlock()
-	}
-
-	a.smu.RLock()
-	rooms, rok := a.socketRooms[sck.GetSID()]
-	a.smu.RUnlock()
-
-	if rok {
-		added := false
-		for _, r := range rooms {
-			if r == room {
-				added = true
-				break
+		sent := map[string]bool{}
+		for _, room := range rooms {
+			if sockets, ok := a.roomSockets.Load(room); ok {
+				sockets.(*sync.Map).Range(func(key, value any) bool {
+					s := value.(Socket)
+					if _, ok1 := sidExcluded[s.SID()]; !ok1 {
+						if _, ok2 := sent[s.SID()]; !ok2 {
+							if _, ok3 := connected[s.SID()]; ok3 {
+								sent[s.SID()] = true
+								a.log.Debug("adapter broadcast sending packet...")
+								s.SendPacket(packet)
+							}
+						}
+					}
+					return true
+				})
 			}
 		}
-		if !added {
-			a.smu.Lock()
-			a.socketRooms[sck.GetSID()] = append(a.socketRooms[sck.GetSID()], room)
-			a.smu.Unlock()
-		}
-	} else {
-		a.smu.Lock()
-		a.socketRooms[sck.GetSID()] = []string{room}
-		a.smu.Unlock()
 	}
 }
 
-func (a *memoryAdapter) Remove(_ context.Context, room string, sck Socket) {
-	a.rmu.RLock()
-	sockets, sok := a.roomSockets[room]
-	a.rmu.RUnlock()
+func (a *adapter) Add(room string, sck Socket) {
+	sockets, _ := a.roomSockets.LoadOrStore(room, new(sync.Map))
+	sockets.(*sync.Map).Store(sck.SID(), sck)
 
-	if sok {
-		newSockets := make([]Socket, 0)
-		for _, s := range sockets {
-			if s.GetSID() != sck.GetSID() {
-				newSockets = append(newSockets, s)
-			}
+	rooms, _ := a.socketRooms.LoadOrStore(sck.SID(), new(sync.Map))
+	rooms.(*sync.Map).Store(room, true)
+}
+
+func (a *adapter) Remove(room string, sck Socket) {
+	if value, ok := a.roomSockets.Load(room); ok {
+		value.(*sync.Map).Delete(sck.SID())
+		remove := true
+		value.(*sync.Map).Range(func(key, value any) bool {
+			remove = false
+			return false
+		})
+		if remove {
+			a.roomSockets.Delete(room)
 		}
-		a.rmu.Lock()
-		if len(newSockets) == 0 {
-			delete(a.roomSockets, room)
-		} else {
-			a.roomSockets[room] = newSockets
-		}
-		a.rmu.Unlock()
 	}
-
-	a.smu.RLock()
-	rooms, rok := a.socketRooms[sck.GetSID()]
-	a.smu.RUnlock()
-
-	if rok {
-		newRooms := make([]string, 0)
-		for _, r := range rooms {
-			if r != room {
-				newRooms = append(newRooms, r)
-			}
+	if value, ok := a.socketRooms.Load(sck.SID()); ok {
+		value.(*sync.Map).Delete(room)
+		remove := true
+		value.(*sync.Map).Range(func(key, value any) bool {
+			remove = false
+			return false
+		})
+		if remove {
+			a.socketRooms.Delete(sck.SID())
 		}
-		a.smu.Lock()
-		if len(newRooms) == 0 {
-			delete(a.socketRooms, sck.GetSID())
-		} else {
-			a.socketRooms[sck.GetSID()] = newRooms
-		}
-		a.smu.Unlock()
 	}
 }
 
-func (a *memoryAdapter) ListClients(room string) []Socket {
-	a.rmu.RLock()
-	defer a.rmu.RUnlock()
-
-	if sockets, ok := a.roomSockets[room]; ok {
-		newSockets := make([]Socket, len(sockets))
-		copy(newSockets, sockets)
-		return newSockets
+func (a *adapter) Clients(room string) []Socket {
+	data := make([]Socket, 0)
+	if sockets, ok := a.roomSockets.Load(room); ok {
+		sockets.(*sync.Map).Range(func(key, value any) bool {
+			data = append(data, value.(Socket))
+			return true
+		})
 	}
-
-	return []Socket{}
+	return data
 }
 
-func (a *memoryAdapter) ListClientRooms(sck Socket) []string {
-	a.smu.RLock()
-	defer a.smu.RUnlock()
-
-	if rooms, ok := a.socketRooms[sck.GetSID()]; ok {
-		newRooms := make([]string, len(rooms))
-		copy(newRooms, rooms)
-		return newRooms
+func (a *adapter) Rooms(client Socket) []string {
+	data := make([]string, 0)
+	if rooms, ok := a.socketRooms.Load(client.SID()); ok {
+		rooms.(*sync.Map).Range(func(key, value any) bool {
+			data = append(data, key.(string))
+			return true
+		})
 	}
-
-	return []string{}
+	return data
 }

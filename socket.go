@@ -1,307 +1,231 @@
 package sio
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"github.com/funcards/engine.io"
 	"github.com/funcards/socket.io-parser/v5"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"net/url"
-	"reflect"
 	"sync"
 )
 
 var _ Socket = (*socket)(nil)
 
-var ErrEmptyEvent = errors.New("event cannot be empty")
+// ReceivedByRemoteAck callback for remote received acknowledgement. Called when remote client calls ack callback.
+type ReceivedByRemoteAck func(args ...any)
 
-type (
-	// AllEventListener callback for all user events received on socket
-	AllEventListener func(ctx context.Context, event string, args ...any)
+// ReceivedByLocalAck callback for local received acknowledgement. Call this method to send ack to remote client.
+type ReceivedByLocalAck func(args ...any)
 
-	// ReceivedByRemoteAcknowledgement callback for remote received acknowledgement. Called when remote client calls ack callback.
-	ReceivedByRemoteAcknowledgement func(ctx context.Context, args ...any)
+type Socket interface {
+	eio.Emitter
 
-	// ReceivedByLocalAcknowledgement callback for local received acknowledgement. Call this method to send ack to remote client.
-	ReceivedByLocalAcknowledgement func(ctx context.Context, args ...any)
+	SID() string
+	Namespace() Namespace
+	ConnectData() any
+	Query() url.Values
+	Headers() map[string]string
+	Disconnect(close bool)
+	Broadcast(rooms []string, event string, args ...any)
+	Send(remoteAck ReceivedByRemoteAck, event string, args ...any)
+	JoinRooms(rooms ...string)
+	LeaveRooms(rooms ...string)
+	LeaveAllRooms()
+	OnEvent(packet siop.Packet)
+	OnAck(packet siop.Packet)
+	OnPacket(packet siop.Packet)
+	OnConnect()
+	OnDisconnect()
+	OnError(msg string, err error)
+	OnClose(reason, description string)
+	SendPacket(packet siop.Packet)
+}
 
-	Socket interface {
-		eio.Emitter
+type socket struct {
+	eio.Emitter
 
-		GetSID() string
-		GetNamespace() Namespace
-		GetConnectData() any
-		GetInitialQuery() url.Values
-		GetInitialHeaders() map[string]string
-		Disconnect(ctx context.Context, close bool)
-		Broadcast(ctx context.Context, rooms []string, event string, args ...any)
-		Send(ctx context.Context, acknowledgement ReceivedByRemoteAcknowledgement, event string, args ...any)
-		JoinRooms(ctx context.Context, rooms ...string)
-		LeaveRooms(ctx context.Context, rooms ...string)
-		LeaveAllRooms(ctx context.Context)
-		RegisterAllEventListener(listener AllEventListener)
-		UnregisterAllEventListener(listener AllEventListener)
-		OnEvent(ctx context.Context, packet siop.Packet)
-		OnAck(ctx context.Context, packet siop.Packet)
-		OnPacket(ctx context.Context, packet siop.Packet)
-		OnConnect(ctx context.Context)
-		OnDisconnect(ctx context.Context)
-		OnClose(ctx context.Context, reason string)
-		OnError(ctx context.Context, msg string)
-		SendPacket(ctx context.Context, packet siop.Packet)
-	}
+	connected *atomic.Bool
+	sid       string
+	nsp       Namespace
+	client    Client
+	data      any
+	log       *zap.Logger
+	rooms     *sync.Map
+	acks      *sync.Map
+}
 
-	socket struct {
-		eio.Emitter
-
-		namespace   *NamespaceImpl
-		client      Client
-		adapter     Adapter
-		connectData any
-		log         *zap.Logger
-		sid         string
-		connected   bool
-
-		emu               sync.Mutex
-		allEventListeners []AllEventListener
-
-		rmu   sync.Mutex
-		rooms map[string]bool
-
-		amu              sync.RWMutex
-		acknowledgements map[uint64]ReceivedByRemoteAcknowledgement
-	}
-)
-
-func NewSocket(namespace *NamespaceImpl, client Client, connectData any, logger *zap.Logger) *socket {
+func NewSocket(nsp Namespace, client Client, data any, logger *zap.Logger) *socket {
 	return &socket{
-		Emitter:           eio.NewEmitter(logger),
-		namespace:         namespace,
-		client:            client,
-		adapter:           namespace.GetAdapter(),
-		connectData:       connectData,
-		log:               logger,
-		sid:               eio.NewSID(),
-		connected:         true,
-		allEventListeners: make([]AllEventListener, 0),
-		rooms:             make(map[string]bool),
-		acknowledgements:  make(map[uint64]ReceivedByRemoteAcknowledgement),
+		Emitter:   eio.NewEmitter(),
+		sid:       eio.NewSID(),
+		connected: atomic.NewBool(true),
+		nsp:       nsp,
+		client:    client,
+		data:      data,
+		log:       logger,
+		rooms:     new(sync.Map),
+		acks:      new(sync.Map),
 	}
 }
 
-func (s *socket) GetSID() string {
+func (s *socket) SID() string {
 	return s.sid
 }
 
-func (s *socket) GetNamespace() Namespace {
-	return s.namespace
+func (s *socket) Namespace() Namespace {
+	return s.nsp
 }
 
-func (s *socket) GetConnectData() any {
-	return s.connectData
+func (s *socket) ConnectData() any {
+	return s.data
 }
 
-func (s *socket) GetInitialQuery() url.Values {
-	return s.client.GetInitialQuery()
+func (s *socket) Query() url.Values {
+	return s.client.Query()
 }
 
-func (s *socket) GetInitialHeaders() map[string]string {
-	return s.client.GetInitialHeaders()
+func (s *socket) Headers() map[string]string {
+	return s.client.Headers()
 }
 
-func (s *socket) Disconnect(ctx context.Context, close bool) {
-	if s.connected {
+func (s *socket) Disconnect(close bool) {
+	if s.connected.Load() {
 		if close {
-			s.client.Disconnect(ctx)
+			s.client.Disconnect()
 			return
 		}
-
-		s.SendPacket(ctx, siop.Packet{Type: siop.Disconnect})
-		s.OnClose(ctx, "server namespace disconnect")
+		s.SendPacket(siop.Packet{Type: siop.Disconnect})
+		s.OnClose("server namespace disconnect", "")
 	}
 }
 
-func (s *socket) Broadcast(ctx context.Context, rooms []string, event string, args ...any) {
+func (s *socket) Broadcast(rooms []string, event string, args ...any) {
 	if len(event) == 0 {
-		eio.TryCancel(ctx, ErrEmptyEvent)
+		s.log.Warn("sio.Socket broadcast: event is empty")
 		return
 	}
 
-	s.adapter.Broadcast(ctx, CreateDataPacket(siop.Event, event, args...), rooms, s.GetSID())
+	s.log.Debug("sio.socket broadcast message", zap.String("sid", s.sid))
+	s.nsp.Adapter().Broadcast(CreateDataPacket(siop.Event, event, args...), rooms, s.sid)
 }
 
-func (s *socket) Send(ctx context.Context, acknowledgement ReceivedByRemoteAcknowledgement, event string, args ...any) {
+func (s *socket) Send(remoteAck ReceivedByRemoteAck, event string, args ...any) {
 	if len(event) == 0 {
-		eio.TryCancel(ctx, ErrEmptyEvent)
+		s.log.Warn("sio.Socket send: event is empty")
 		return
 	}
 
 	packet := CreateDataPacket(siop.Event, event, args...)
-
-	if acknowledgement != nil {
-		id := s.namespace.NextID()
+	if remoteAck != nil {
+		id := s.nsp.NextAckID()
 		packet.ID = &id
-
-		s.amu.Lock()
-		s.acknowledgements[id] = acknowledgement
-		s.amu.Unlock()
+		s.acks.Store(packet.ID, remoteAck)
 	}
-
-	s.SendPacket(ctx, packet)
+	s.SendPacket(packet)
 }
 
-func (s *socket) JoinRooms(ctx context.Context, rooms ...string) {
-	s.rmu.Lock()
-	defer s.rmu.Unlock()
-
+func (s *socket) JoinRooms(rooms ...string) {
 	for _, room := range rooms {
-		if _, ok := s.rooms[room]; !ok {
-			s.adapter.Add(ctx, room, s)
-			s.rooms[room] = true
+		if _, ok := s.rooms.LoadOrStore(room, true); !ok {
+			s.nsp.Adapter().Add(room, s)
 		}
 	}
 }
 
-func (s *socket) LeaveRooms(ctx context.Context, rooms ...string) {
-	s.rmu.Lock()
-	defer s.rmu.Unlock()
-
+func (s *socket) LeaveRooms(rooms ...string) {
 	for _, room := range rooms {
-		if _, ok := s.rooms[room]; ok {
-			s.adapter.Remove(ctx, room, s)
-			delete(s.rooms, room)
+		if _, ok := s.rooms.LoadAndDelete(room); ok {
+			s.nsp.Adapter().Remove(room, s)
 		}
 	}
 }
 
-func (s *socket) LeaveAllRooms(ctx context.Context) {
-	s.rmu.Lock()
-	defer s.rmu.Unlock()
-
-	for room, _ := range s.rooms {
-		s.adapter.Remove(ctx, room, s)
-	}
-
-	s.rooms = make(map[string]bool)
+func (s *socket) LeaveAllRooms() {
+	s.rooms.Range(func(key, value any) bool {
+		s.nsp.Adapter().Remove(key.(string), s)
+		return true
+	})
+	s.rooms = new(sync.Map)
 }
 
-func (s *socket) RegisterAllEventListener(listener AllEventListener) {
-	s.emu.Lock()
-	defer s.emu.Unlock()
-
-	s.allEventListeners = append(s.allEventListeners, listener)
-}
-
-func (s *socket) UnregisterAllEventListener(listener AllEventListener) {
-	s.emu.Lock()
-	defer s.emu.Unlock()
-
-	ptr := reflect.ValueOf(listener).Pointer()
-	newListeners := make([]AllEventListener, 0)
-	for _, l := range s.allEventListeners {
-		if ptr != reflect.ValueOf(l).Pointer() {
-			newListeners = append(newListeners, l)
-		}
-	}
-	s.allEventListeners = newListeners
-}
-
-func (s *socket) OnEvent(ctx context.Context, packet siop.Packet) {
+func (s *socket) OnEvent(packet siop.Packet) {
 	args := s.unpackData(packet.Data)
 
 	if packet.ID != nil {
-		emitArgs := make([]any, len(args)+1)
-		copy(emitArgs, args)
-		emitArgs[len(args)] = ReceivedByLocalAcknowledgement(func(ctx context.Context, args1 ...any) {
+		args = append(args, ReceivedByLocalAck(func(args1 ...any) {
 			ack := CreateDataPacket(siop.Ack, "", args1...)
 			ack.ID = packet.ID
-			s.SendPacket(ctx, ack)
-		})
-		args = emitArgs
+			s.SendPacket(ack)
+		}))
 	}
 
-	event := args[0].(string)
-	eventArgs := make([]any, len(args)-1)
-	copy(eventArgs, args[1:])
+	s.Fire(args[0].(string), args[1:]...)
+}
 
-	s.Emit(ctx, event, eventArgs...)
-
-	s.emu.Lock()
-	defer s.emu.Unlock()
-
-	for _, listener := range s.allEventListeners {
-		listener(ctx, event, eventArgs...)
+func (s *socket) OnAck(packet siop.Packet) {
+	if ack, ok := s.acks.LoadAndDelete(packet.ID); ok {
+		ack.(ReceivedByRemoteAck)(s.unpackData(packet.Data)...)
 	}
 }
 
-func (s *socket) OnAck(ctx context.Context, packet siop.Packet) {
-	s.amu.RLock()
-	ack, ok := s.acknowledgements[*packet.ID]
-	s.amu.RUnlock()
-
-	if ok {
-		s.amu.Lock()
-		delete(s.acknowledgements, *packet.ID)
-		s.amu.Unlock()
-
-		ack(ctx, s.unpackData(packet.Data)...)
-	}
-}
-
-func (s *socket) OnPacket(ctx context.Context, packet siop.Packet) {
+func (s *socket) OnPacket(packet siop.Packet) {
 	switch packet.Type {
 	case siop.Event, siop.BinaryEvent:
-		s.OnEvent(ctx, packet)
+		s.OnEvent(packet)
 	case siop.Ack, siop.BinaryAck:
-		s.OnAck(ctx, packet)
+		s.OnAck(packet)
 	case siop.Disconnect:
-		s.OnDisconnect(ctx)
+		s.OnDisconnect()
 	case siop.ConnectError:
-		s.OnError(ctx, packet.Data.(string))
+		s.OnError(packet.Type.String(), errors.New(packet.Data.(string)))
 	}
 }
 
-func (s *socket) OnConnect(ctx context.Context) {
-	s.log.Debug("sio.Socket new connection", zap.String("sid", s.GetSID()), zap.Any("connect_data", s.connectData))
-
-	s.namespace.AddConnected(s)
-	s.JoinRooms(ctx, s.GetSID())
-	s.SendPacket(ctx, siop.Packet{
+func (s *socket) OnConnect() {
+	s.nsp.AddConnected(s)
+	s.JoinRooms(s.sid)
+	s.SendPacket(siop.Packet{
 		Type: siop.Connect,
 		Data: map[string]string{
-			"sid": s.GetSID(),
+			"sid": s.sid,
 		},
 	})
 }
 
-func (s *socket) OnDisconnect(ctx context.Context) {
-	s.OnClose(ctx, "client namespace disconnect")
+func (s *socket) OnDisconnect() {
+	s.OnClose("client disconnect", "")
 }
 
-func (s *socket) OnClose(ctx context.Context, reason string) {
-	if !s.connected {
+func (s *socket) OnError(msg string, err error) {
+	s.log.Warn(msg, zap.Error(err))
+	s.Fire(eio.TopicError, msg, err.Error())
+}
+
+func (s *socket) OnClose(reason, description string) {
+	s.log.Debug("sio.Socket OnClose -- START", zap.String("sid", s.sid), zap.String("reason", reason), zap.String("description", description))
+
+	if !s.connected.Load() {
 		return
 	}
 
-	s.Emit(ctx, eio.TopicDisconnecting, reason)
+	s.Fire(eio.TopicDisconnecting, reason, description)
 
-	s.LeaveAllRooms(ctx)
-	s.namespace.Remove(s)
+	s.LeaveAllRooms()
+	s.connected.Store(false)
 	s.client.Remove(s)
-	s.connected = false
-	s.namespace.RemoveConnected(s)
+	s.nsp.Remove(s)
+	s.nsp.RemoveConnected(s)
 
-	s.Emit(ctx, eio.TopicDisconnect, reason)
+	s.Fire(eio.TopicDisconnect, reason, description)
+
+	s.log.Debug("sio.Socket OnClose -- END", zap.String("sid", s.sid), zap.String("reason", reason), zap.String("description", description))
 }
 
-func (s *socket) OnError(ctx context.Context, msg string) {
-	s.Emit(ctx, eio.TopicError, msg)
-}
-
-func (s *socket) SendPacket(ctx context.Context, packet siop.Packet) {
-	packet.Nsp = s.namespace.GetName()
-	s.client.SendPacket(ctx, packet)
+func (s *socket) SendPacket(packet siop.Packet) {
+	packet.Nsp = s.nsp.Name()
+	s.client.Send(packet)
 }
 
 func (s *socket) unpackData(data any) (newData []any) {

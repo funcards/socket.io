@@ -1,105 +1,100 @@
 package sio
 
 import (
-	"context"
 	"github.com/funcards/engine.io"
 	"go.uber.org/zap"
 	"sync"
 	"time"
 )
 
-type (
-	Config struct {
-		ConnectionTimeout time.Duration `yaml:"connection_timeout" env-default:"90s" env:"SIO_CONNECTION_TIMEOUT"`
-	}
+var _ Server = (*server)(nil)
 
-	Server interface {
-		eio.Emitter
+type Config struct {
+	ConnectionTimeout time.Duration `yaml:"connection_timeout" env-default:"90s" env:"SIO_CONNECTION_TIMEOUT"`
+}
 
-		GetConfig() Config
-		GetAdapterFactory() AdapterFactory
-		HasNamespace(nsp string) bool
-		CheckNamespace(nsp string) bool
-		Namespace(nsp string) Namespace
-	}
+type Server interface {
+	Cfg() Config
+	Shutdown()
+	AdapterFactory() AdapterFactory
+	HasNamespace(nsp string) bool
+	Namespace(nsp string) Namespace
+}
 
-	server struct {
-		eio.Emitter
+type server struct {
+	cfg            Config
+	eServer        eio.Server
+	adapterFactory AdapterFactory
+	log            *zap.Logger
+	namespaces     *sync.Map
+	stop           chan struct{}
+}
 
-		eServer        eio.Server
-		adapterFactory AdapterFactory
-		cfg            Config
-		log            *zap.Logger
-
-		namespaces map[string]*NamespaceImpl
-		nmu        sync.RWMutex
-	}
-)
-
-func NewServer(eServer eio.Server, adapterFactory AdapterFactory, cfg Config, logger *zap.Logger) *server {
+func NewServer(cfg Config, eServer eio.Server, adapterFactory AdapterFactory, logger *zap.Logger) *server {
 	s := &server{
-		Emitter:        eio.NewEmitter(logger),
+		cfg:            cfg,
 		eServer:        eServer,
 		adapterFactory: adapterFactory,
-		cfg:            cfg,
 		log:            logger,
-		namespaces:     make(map[string]*NamespaceImpl),
+		namespaces:     new(sync.Map),
+		stop:           make(chan struct{}, 1),
 	}
-
-	_ = s.Namespace("/")
-
-	eServer.On(eio.TopicConnection, func(ctx context.Context, event *eio.Event) {
-		sck := event.Get(0).(eio.Socket)
-		NewClient(ctx, s, sck, logger)
-	})
-
+	s.setup()
 	return s
 }
 
-func (s *server) GetConfig() Config {
+func (s *server) Cfg() Config {
 	return s.cfg
 }
 
-func (s *server) GetAdapterFactory() AdapterFactory {
+func (s *server) Shutdown() {
+	close(s.stop)
+}
+
+func (s *server) AdapterFactory() AdapterFactory {
 	return s.adapterFactory
 }
 
 func (s *server) HasNamespace(nsp string) bool {
-	if nsp[0] != '/' {
-		nsp = "/" + nsp
-	}
-
-	s.nmu.RLock()
-	defer s.nmu.RUnlock()
-
-	_, ok := s.namespaces[nsp]
-
+	_, ok := s.namespaces.Load(norm(nsp))
 	return ok
 }
 
-func (s *server) CheckNamespace(nsp string) bool {
-	if nsp[0] != '/' {
-		nsp = "/" + nsp
+func (s *server) Namespace(nsp string) Namespace {
+	nsp = norm(nsp)
+	if value, ok := s.namespaces.Load(nsp); ok {
+		return value.(Namespace)
 	}
-	return false // TODO: implements provider functionality
+
+	s.log.Debug("create new namespace", zap.String("nsp", nsp))
+	n := NewNamespace(nsp, s, s.log)
+	s.namespaces.Store(nsp, n)
+	return n
 }
 
-func (s *server) Namespace(nsp string) Namespace {
+func (s *server) setup() {
+	_ = s.Namespace("/")
+	go s.run()
+}
+
+func (s *server) run() {
+	onConnection := s.eServer.On(eio.TopicConnection)
+	defer s.eServer.Off(eio.TopicConnection, onConnection)
+
+	for {
+		select {
+		case <-s.stop:
+			return
+		case event := <-onConnection:
+			sck := event.Args[0].(eio.Socket)
+			NewClient(s, sck, s.log)
+		}
+	}
+}
+
+func norm(nsp string) string {
 	if nsp[0] != '/' {
-		nsp = "/" + nsp
+		return "/" + nsp
 	}
-
-	s.nmu.RLock()
-	n, ok := s.namespaces[nsp]
-	s.nmu.RUnlock()
-
-	if !ok {
-		n = NewNamespaceImpl(nsp, s, s.log)
-
-		s.nmu.Lock()
-		s.namespaces[nsp] = n
-		s.nmu.Unlock()
-	}
-
-	return n
+	return nsp
 }
